@@ -1,0 +1,40 @@
+{
+  "expo": {
+    "name": "Resonance",
+    "slug": "resonance-app",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "scheme": "resonance",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#0b0f1a",
+    "splash": {
+      "image": "./assets/icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0b0f1a"
+    },
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "android": {
+      "package": "com.emilylo.resonance",
+      "versionCode": 1,
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/icon.png",
+        "backgroundColor": "#0b0f1a"
+      }
+    },
+    "ios": {
+      "bundleIdentifier": "com.emilylo.resonance",
+      "supportsTablet": true
+    },
+    "extra": {
+      "eas": {
+        "projectId": "9914868a-56cd-4732-8080-6621fa85237b"
+      }
+    },
+    "plugins": [
+      "expo-audio"
+    ]
+  }
+}
