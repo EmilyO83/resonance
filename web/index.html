@@ -142,6 +142,16 @@
   .timer-live{margin-top:12px; text-align:center; font-size:26px; font-weight:600; letter-spacing:2px; color:var(--teal); display:none;}
   .timer-live.show{display:block;}
 
+  .cyc-live{margin-top:14px; text-align:center; display:none;}
+  .cyc-live.show{display:block;}
+  .cyc-phase{font-size:12px; letter-spacing:2px; text-transform:uppercase; color:var(--ink-faint);}
+  .cyc-phase b{color:var(--teal); font-weight:600;}
+  .cyc-count{font-size:26px; font-weight:600; letter-spacing:2px; color:var(--teal); margin-top:4px;}
+  .cyc-dots{display:flex; justify-content:center; gap:8px; margin-top:12px;}
+  .cyc-dots .d{width:10px; height:10px; border-radius:50%; background:rgba(255,255,255,.12); transition:all .3s ease;}
+  .cyc-dots .d.done{background:var(--teal);}
+  .cyc-dots .d.now{background:var(--gold); box-shadow:0 0 10px var(--gold);}
+
   .fav-list{display:flex; flex-direction:column; gap:8px; margin-top:8px;}
   .fav-item{display:flex; align-items:center; gap:10px; padding:12px 14px; border-radius:14px; border:1px solid var(--line); background:rgba(255,255,255,.03);}
   .fav-item .f-main{flex:1; cursor:pointer;}
@@ -330,6 +340,39 @@
         <div class="pill" data-min="60">60m</div>
       </div>
       <div class="timer-live" id="timerLive">00:00</div>
+    </div>
+
+    <!-- Sleep cycles -->
+    <div class="card">
+      <div class="toggle-line">
+        <span>🌙 Sleep cycles <span style="color:var(--ink-faint);font-size:11px;">(all night)</span></span>
+        <label class="switch"><input type="checkbox" id="cycToggle" /><span class="slider-sw"></span></label>
+      </div>
+      <div class="mode-block" id="cycBlock">
+        <div class="bin-note">Fades in, holds through a sleep cycle, fades out, then rests in silence so your dreams have room, then fades back in. Repeats for a set number of cycles, then stops.</div>
+        <div class="row" style="margin-top:14px;">
+          <label>On per cycle <span class="val" id="cycOnVal">90 min</span></label>
+          <input type="range" id="cycOn" min="20" max="120" step="5" value="90" />
+        </div>
+        <div class="row">
+          <label>Rest gap <span class="val" id="cycGapVal">20 min</span></label>
+          <input type="range" id="cycGap" min="5" max="45" step="5" value="20" />
+        </div>
+        <div class="row">
+          <label>Fade length <span class="val" id="cycFadeVal">2 min</span></label>
+          <input type="range" id="cycFade" min="1" max="10" step="1" value="2" />
+        </div>
+        <div class="row">
+          <label>Number of cycles <span class="val" id="cycNumVal">4</span></label>
+          <input type="range" id="cycNum" min="1" max="6" step="1" value="4" />
+        </div>
+        <div class="bin-note" id="cycTotal" style="color:var(--ink-faint); margin-top:4px;"></div>
+      </div>
+      <div class="cyc-live" id="cycLive">
+        <div class="cyc-phase" id="cycPhase">Cycle <b>1</b> of 4</div>
+        <div class="cyc-count" id="cycCount">00:00</div>
+        <div class="cyc-dots" id="cycDots"></div>
+      </div>
     </div>
 
     <!-- Entrainment modes -->
@@ -606,7 +649,28 @@ let sweepOn= false;
 let sweepFrom=396, sweepTo=963, sweepDur=3;
 let timerMin=0, timerId=null, timerEnd=0, timerTick=null;
 
-function persist(){ LS.set('res_settings', {freq,wave,vol,mode,beat,isoRate,gapV3:strikeGap}); }
+/* Sleep cycles: fade in -> hold -> fade out -> silent rest -> repeat, N times.
+   Everything is driven from here in the WebView. Fades are gradual volume
+   ramps (they work on both the native and web audio paths because they just
+   move `vol` and call applyVol), the rest gap is a genuine stop() so nothing
+   sounds, and keep-awake stays active across the gap so the next fade-in fires
+   on time. This is deliberately NOT the plain sleep timer: that does one hard
+   fade-out and stops. */
+let cycOn = (S.cycOn!==undefined)?S.cycOn:90;      // minutes of tone per cycle (incl. fades)
+let cycGap = (S.cycGap!==undefined)?S.cycGap:20;   // minutes of silence between cycles
+let cycFade = (S.cycFade!==undefined)?S.cycFade:2; // minutes for each fade in/out
+let cycNum = (S.cycNum!==undefined)?S.cycNum:4;    // how many cycles, then stop
+let cycOn_toggle = false;                           // is the mode armed
+let cycActive = false;                              // is a cycle sequence running
+let cycIndex = 0;                                   // 0-based current cycle
+let cycPhaseEnd = 0;                                // performance.now() the current phase ends
+let cycPhaseName = '';                              // 'in' | 'hold' | 'out' | 'rest'
+let cycFadeStep = null;                             // interval driving a fade ramp
+let cycPhaseTimer = null;                           // timeout to advance to next phase
+let cycTick = null;                                 // interval updating the readout
+let cycTargetVol = 0.4;                             // volume to fade up to (captured at start)
+
+function persist(){ LS.set('res_settings', {freq,wave,vol,mode,beat,isoRate,gapV3:strikeGap,cycOn,cycGap,cycFade,cycNum}); }
 
 function ensureCtx(){
   if(!ctx){
@@ -847,7 +911,15 @@ function stop(){
   clearTimer();
   updatePlayUI();
 }
-function toggle(){ playing?stop():play(); }
+function toggle(){
+  // When sleep cycles is armed, the play button starts/stops the whole
+  // overnight sequence instead of a single continuous tone.
+  if(cycOn_toggle){
+    if(cycActive) cycFinish(false); else cycStart();
+    return;
+  }
+  playing?stop():play();
+}
 
 /* ---- native bridge ----
    When running inside the Expo wrapper, window.ReactNativeWebView exists.
@@ -944,8 +1016,9 @@ function rebuildLive(){
 function applyVol(){ if(useNativeAudio()){ nativeUpdate(); persist(); return; } if(playing && !isStruck(wave)) rampMaster(vol,0.05); persist(); }
 
 function updatePlayUI(){
-  $('playBtn').textContent = playing?'■  STOP':'▶   PLAY TONE';
-  $('orbTag').textContent = playing?'playing':'tap to play';
+  const on = playing || cycActive;   // during a rest gap playing is false but the sequence is live
+  $('playBtn').textContent = on?'■  STOP':'▶   PLAY TONE';
+  $('orbTag').textContent = cycActive ? (playing?'sleep cycle':'resting') : (playing?'playing':'tap to play');
 }
 
 /* ---- timer ---- */
@@ -961,6 +1034,163 @@ function startTimer(){
   }, 250);
 }
 function clearTimer(){ if(timerTick){clearInterval(timerTick); timerTick=null;} $('timerLive').classList.remove('show'); }
+
+/* ---- sleep cycles ---- */
+function cycClearTimers(){
+  if(cycFadeStep){ clearInterval(cycFadeStep); cycFadeStep=null; }
+  if(cycPhaseTimer){ clearTimeout(cycPhaseTimer); cycPhaseTimer=null; }
+  if(cycTick){ clearInterval(cycTick); cycTick=null; }
+}
+
+/* Move `vol` smoothly from its current value to `to` over `mins` minutes, then
+   run done(). Steps every 500ms and pushes each step through applyVol(), so the
+   ramp works whether the tone is native or web audio. */
+function cycFadeTo(to, mins, done){
+  if(cycFadeStep){ clearInterval(cycFadeStep); cycFadeStep=null; }
+  const from = vol;
+  const totalMs = Math.max(500, mins*60000);
+  const start = performance.now();
+  const apply = (v)=>{
+    vol = Math.max(0, Math.min(1, v));
+    $('volSlider').value = Math.round(vol*100);
+    $('volVal').textContent = Math.round(vol*100)+'%';
+    applyVol();
+  };
+  cycFadeStep = setInterval(()=>{
+    const t = Math.min(1, (performance.now()-start)/totalMs);
+    apply(from + (to-from)*t);
+    if(t>=1){ clearInterval(cycFadeStep); cycFadeStep=null; if(done) done(); }
+  }, 500);
+}
+
+function cycRenderDots(){
+  const wrap=$('cycDots'); wrap.innerHTML='';
+  for(let i=0;i<cycNum;i++){
+    const d=document.createElement('div'); d.className='d';
+    if(i<cycIndex) d.classList.add('done');
+    else if(i===cycIndex && cycPhaseName!=='rest') d.classList.add('now');
+    wrap.appendChild(d);
+  }
+}
+
+const CYC_LABELS = { in:'fading in', hold:'holding', out:'fading out', rest:'resting' };
+function cycUpdateReadout(){
+  if(!cycActive) return;
+  const left = Math.max(0, cycPhaseEnd - performance.now());
+  const s = Math.ceil(left/1000);
+  $('cycCount').textContent = String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0');
+  const shown = Math.min(cycIndex+1, cycNum);
+  $('cycPhase').innerHTML = 'Cycle <b>'+shown+'</b> of '+cycNum+' · '+(CYC_LABELS[cycPhaseName]||'');
+}
+
+/* The rest gap does NOT do a real stop(). A true stop sends {type:'stop'} to
+   the native layer, which calls deactivateKeepAwake -> the device can then doze
+   during the silent gap and the next fade-in might never fire. Instead we leave
+   the tone running at an inaudible volume (already 0.0001 from the fade-out).
+   Keep-awake stays active, the native audio session stays warm, and the fade
+   back in is click-free. `playing` is set false only to drive the readout UI
+   ('resting'); the audio graph is untouched. */
+function cycSilence(){
+  playing=false;                 // for the UI readout only
+  document.body.classList.remove('playing');
+  updatePlayUI();
+}
+
+/* Bring the (still-running, inaudible) tone back for a fade-in. The tone was
+   never stopped during the gap, so this just marks it playing again; the caller
+   then ramps the volume up. If for any reason the graph was torn down, rebuild.*/
+function cycStartTone(){
+  vol = 0.0001;
+  $('volSlider').value = 0; $('volVal').textContent = '0%';
+  const wasPlaying = playing;
+  playing=true;
+  document.body.classList.add('playing');
+  if(useNativeAudio()){
+    // native tone kept looping through the gap; nudge it back to vol 0.0001
+    if(!wasPlaying) nativePlay(); else nativeUpdate();
+  } else {
+    // web audio: master was ramped to ~0 during the gap; make sure a graph exists
+    ensureCtx(); startKeepAlive();
+    if(!nodes && !isStruck(wave)) buildGraph();
+    if(!isStruck(wave)){ rampMaster(vol,0.12); if(sweepOn) startSweep(); }
+  }
+  updatePlayUI();
+}
+
+/* Advance to the next phase of the cycle sequence. Phases per cycle:
+   in (fade up) -> hold (steady) -> out (fade down) -> rest (silence).
+   After the rest of the last cycle, stop for good. */
+function cycNext(){
+  if(!cycActive) return;
+  cycClearTimers();
+
+  const setPhase = (name, mins, onEnter)=>{
+    cycPhaseName = name;
+    cycPhaseEnd = performance.now() + mins*60000;
+    cycRenderDots(); cycUpdateReadout();
+    cycTick = setInterval(cycUpdateReadout, 250);
+    if(onEnter) onEnter();
+    // hold/rest are pure waits; in/out are driven by the fade and self-advance.
+    if(name==='hold' || name==='rest'){
+      cycPhaseTimer = setTimeout(cycNext, mins*60000);
+    }
+  };
+
+  if(cycPhaseName==='' ){
+    // Very first entry: begin cycle 0 with a fade-in.
+    cycIndex = 0;
+    cycStartTone();
+    setPhase('in', cycFade, ()=> cycFadeTo(cycTargetVol, cycFade, cycNext));
+  } else if(cycPhaseName==='in'){
+    // held time = on-time minus the two fades (floor so it never goes negative)
+    const hold = Math.max(0, cycOn - 2*cycFade);
+    setPhase('hold', hold);
+  } else if(cycPhaseName==='hold'){
+    setPhase('out', cycFade, ()=> cycFadeTo(0.0001, cycFade, ()=>{ cycSilence(); cycNext(); }));
+  } else if(cycPhaseName==='out'){
+    // fade-out finished and tone silenced; now rest, unless that was the last cycle
+    if(cycIndex >= cycNum-1){ cycFinish(true); return; }
+    setPhase('rest', cycGap);
+  } else if(cycPhaseName==='rest'){
+    cycIndex++;
+    cycStartTone();
+    setPhase('in', cycFade, ()=> cycFadeTo(cycTargetVol, cycFade, cycNext));
+  }
+}
+
+function cycStart(){
+  cycClearTimers();
+  cycActive = true;
+  cycIndex = 0;
+  cycPhaseName = '';
+  cycTargetVol = vol > 0.01 ? vol : 0.4;   // remember the level to fade up to
+  $('cycLive').classList.add('show');
+  if(timerMin>0){ /* the plain timer is disabled while cycling, see toggles */ }
+  cycNext();
+}
+
+function cycFinish(showToast){
+  cycClearTimers();
+  cycActive = false;
+  cycPhaseName = '';
+  $('cycLive').classList.remove('show');
+  // restore the slider to the target volume for next time
+  vol = cycTargetVol;
+  $('volSlider').value = Math.round(vol*100);
+  $('volVal').textContent = Math.round(vol*100)+'%';
+  // Make sure everything is genuinely stopped. During a rest gap `playing` is
+  // false but the tone is still looping inaudibly (native) or the web graph is
+  // still alive at ~0 volume, so force a real teardown either way.
+  playing = true;   // so stop() runs its full teardown path
+  stop();
+  if(showToast) toast('Sleep cycles finished');
+}
+
+function cycUpdateTotalLabel(){
+  const total = cycNum*cycOn + (cycNum-1)*cycGap;
+  const h = Math.floor(total/60), m = total%60;
+  $('cycTotal').textContent = 'About '+ (h? h+' h ':'') + (m? m+' min':'') + ' in total, then stops.';
+}
 
 /* ================= WIRE UP ================= */
 $('playBtn').addEventListener('click', toggle);
@@ -1008,7 +1238,34 @@ document.querySelectorAll('#timerGrid .pill').forEach(p=>p.addEventListener('cli
   document.querySelectorAll('#timerGrid .pill').forEach(x=>x.classList.remove('active'));
   p.classList.add('active'); timerMin=parseInt(p.dataset.min);
   if(playing && timerMin>0) startTimer(); else clearTimer();
+  // Sleep cycles and the plain sleep timer both want to end playback; don't let
+  // them fight. Choosing a timer disarms cycles.
+  if(timerMin>0 && cycOn_toggle){
+    cycOn_toggle=false; $('cycToggle').checked=false; $('cycBlock').classList.remove('show');
+    if(cycActive) cycFinish(false);
+  }
 }));
+
+/* sleep cycles */
+$('cycToggle').addEventListener('change', e=>{
+  cycOn_toggle = e.target.checked;
+  $('cycBlock').classList.toggle('show', cycOn_toggle);
+  if(cycOn_toggle){
+    // arming cycles turns the plain sleep timer off so they can't both end playback
+    if(timerMin>0){
+      timerMin=0;
+      document.querySelectorAll('#timerGrid .pill').forEach(x=>x.classList.toggle('active', x.dataset.min==='0'));
+      clearTimer();
+    }
+    cycUpdateTotalLabel();
+  } else if(cycActive){
+    cycFinish(false);
+  }
+});
+$('cycOn').addEventListener('input', e=>{ cycOn=parseInt(e.target.value); $('cycOnVal').textContent=cycOn+' min'; cycUpdateTotalLabel(); persist(); });
+$('cycGap').addEventListener('input', e=>{ cycGap=parseInt(e.target.value); $('cycGapVal').textContent=cycGap+' min'; cycUpdateTotalLabel(); persist(); });
+$('cycFade').addEventListener('input', e=>{ cycFade=parseInt(e.target.value); $('cycFadeVal').textContent=cycFade+' min'; persist(); });
+$('cycNum').addEventListener('input', e=>{ cycNum=parseInt(e.target.value); $('cycNumVal').textContent=cycNum; cycUpdateTotalLabel(); persist(); });
 
 /* sweep */
 $('sweepToggle').addEventListener('change', e=>{ sweepOn=e.target.checked; $('sweepBlock').classList.toggle('show', sweepOn); if(NATIVE){ nativeUpdate(); } else if(playing){ if(sweepOn) startSweep(); else applyFreq(); } });
@@ -1201,6 +1458,11 @@ if(mode==='binaural'){ $('binToggle').checked=true; $('binBlock').classList.add(
 if(mode==='iso'){ $('isoToggle').checked=true; $('isoBlock').classList.add('show'); }
 $('gapSlider').value = strikeGap; $('gapVal').textContent = strikeGap + 's';
 $('strikeBlock').style.display = isStruck(wave) ? 'block' : 'none';
+$('cycOn').value=cycOn; $('cycOnVal').textContent=cycOn+' min';
+$('cycGap').value=cycGap; $('cycGapVal').textContent=cycGap+' min';
+$('cycFade').value=cycFade; $('cycFadeVal').textContent=cycFade+' min';
+$('cycNum').value=cycNum; $('cycNumVal').textContent=cycNum;
+cycUpdateTotalLabel();
 applyFreq(); calcCubit(); renderFavs(); renderJournal();
 
 /* Keep-alive: once the context exists, run a permanently-silent source into
