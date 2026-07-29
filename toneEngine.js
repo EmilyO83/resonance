@@ -161,7 +161,14 @@ export async function ensureAudioMode() {
   try {
     await setAudioModeAsync({
       playsInSilentMode: true,
-      shouldPlayInBackground: false,
+      // TRUE so the tone survives a locked / dozing / backgrounded phone. This
+      // is what lets it play "while asleep": the OS keeps the audio session
+      // alive off-screen instead of us relying on expo-keep-awake + WebView
+      // timers (which Android freezes the moment the screen goes off). Requires
+      // the native background-audio config in app.json (iOS UIBackgroundModes
+      // ["audio"], Android FOREGROUND_SERVICE*), so it only takes effect in a
+      // fresh native build, not an OTA update.
+      shouldPlayInBackground: true,
       interruptionMode: 'mixWithOthers',
     });
   } catch (e) {}

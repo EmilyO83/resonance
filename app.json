@@ -26,8 +26,9 @@
       "permissions": [
         "android.permission.RECORD_AUDIO",
         "android.permission.MODIFY_AUDIO_SETTINGS",
-        "android.permission.RECORD_AUDIO",
-        "android.permission.MODIFY_AUDIO_SETTINGS"
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK",
+        "android.permission.WAKE_LOCK"
       ],
       "runtimeVersion": {
         "policy": "appVersion"
@@ -35,7 +36,12 @@
     },
     "ios": {
       "bundleIdentifier": "com.emilylo.resonance",
-      "supportsTablet": true
+      "supportsTablet": true,
+      "infoPlist": {
+        "UIBackgroundModes": [
+          "audio"
+        ]
+      }
     },
     "extra": {
       "eas": {
@@ -43,7 +49,12 @@
       }
     },
     "plugins": [
-      "expo-audio"
+      [
+        "expo-audio",
+        {
+          "microphonePermission": false
+        }
+      ]
     ],
     "updates": {
       "url": "https://u.expo.dev/9914868a-56cd-4732-8080-6621fa85237b"

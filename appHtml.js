@@ -944,6 +944,46 @@ function nativeUpdate(){ if(playing) nativeSend({ type:'update', ...audioState()
 /* legacy single-string signal kept for keep-awake compatibility */
 function notifyNative(state){ nativeSend({ type: state==='playing'?'play':'stop', ...(state==='playing'?audioState():{}) }); }
 
+/* ---- native -> web (Sleep Cycles readout) ----
+   During a native Sleep Cycles run, the RN layer owns the clock and posts phase
+   updates here. We only mirror them into the readout state; the audio is driven
+   natively, so a frozen WebView (screen off) just means a stale on-screen
+   counter, never silence. */
+let cycNativeTick = null;
+function onNativeMessage(raw){
+  let m; try{ m = JSON.parse(raw); }catch(e){ return; }
+  if(m.cyc === 'phase'){
+    cycActive = true;
+    cycIndex = m.index;
+    cycPhaseName = m.phase;
+    cycPhaseEnd = performance.now() + (m.msLeft||0);
+    playing = (m.phase !== 'rest');   // 'resting' readout during the gap
+    document.body.classList.toggle('playing', playing);
+    cycRenderDots(); cycUpdateReadout(); updatePlayUI();
+    // local cosmetic countdown between phase reports; safe if it freezes off-screen
+    if(cycNativeTick) clearInterval(cycNativeTick);
+    cycNativeTick = setInterval(cycUpdateReadout, 250);
+  } else if(m.cyc === 'done'){
+    if(cycNativeTick){ clearInterval(cycNativeTick); cycNativeTick=null; }
+    // native sequence finished on its own; reset the UI without re-messaging native
+    cycClearTimers();
+    cycActive = false; cycPhaseName = ''; playing = false;
+    document.body.classList.remove('playing');
+    $('cycLive').classList.remove('show');
+    vol = cycTargetVol;
+    $('volSlider').value = Math.round(vol*100);
+    $('volVal').textContent = Math.round(vol*100)+'%';
+    updatePlayUI();
+    toast('Sleep cycles finished');
+  }
+}
+// RN's WebView.postMessage dispatches a 'message' event; Android fires it on
+// document, iOS on window. Listen on both.
+if(NATIVE){
+  document.addEventListener('message', e=>onNativeMessage(e.data));
+  window.addEventListener('message', e=>onNativeMessage(e.data));
+}
+
 /* sweep */
 function startSweep(){
   if(!nodes||!nodes.oscA) return;
@@ -1167,6 +1207,22 @@ function cycStart(){
   cycPhaseName = '';
   cycTargetVol = vol > 0.01 ? vol : 0.4;   // remember the level to fade up to
   $('cycLive').classList.add('show');
+
+  // NATIVE: hand the whole cycle plan to the RN layer and let IT run the fades
+  // and phase timers. RN's JS timers keep firing when the screen sleeps, so the
+  // sequence survives overnight; WebView timers (below) would freeze off-screen.
+  // We keep only a LOCAL readout ticker; the native side tells us the phase.
+  if(useNativeAudio()){
+    playing = true;
+    document.body.classList.add('playing');
+    nativeSend({ type:'cycle',
+      freq, wave, mode, beat, isoRate,
+      on: cycOn, gap: cycGap, fade: cycFade, num: cycNum,
+      targetVol: cycTargetVol });
+    updatePlayUI();
+    return;
+  }
+
   if(timerMin>0){ /* the plain timer is disabled while cycling, see toggles */ }
   cycNext();
 }
@@ -1180,6 +1236,19 @@ function cycFinish(showToast){
   vol = cycTargetVol;
   $('volSlider').value = Math.round(vol*100);
   $('volVal').textContent = Math.round(vol*100)+'%';
+
+  // NATIVE: the RN scheduler owns the tone. Tell it to stop; do NOT run the web
+  // teardown path (there is no web audio graph to tear down here).
+  if(useNativeAudio()){
+    if(cycNativeTick){ clearInterval(cycNativeTick); cycNativeTick=null; }
+    nativeSend({ type:'cycleStop' });
+    playing = false;
+    document.body.classList.remove('playing');
+    updatePlayUI();
+    if(showToast) toast('Sleep cycles finished');
+    return;
+  }
+
   // Make sure everything is genuinely stopped. During a rest gap \`playing\` is
   // false but the tone is still looping inaudibly (native) or the web graph is
   // still alive at ~0 volume, so force a real teardown either way.
